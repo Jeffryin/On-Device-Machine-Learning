@@ -1,0 +1,29 @@
+meta:
+  parts_csv_path: ./data/parts.csv
+  images_root: ./data/CNN
+  image_size: 128
+  train_split: 0.8
+  random_seed: 42
+  grayscale: false
+  duplicate_singletons_for_test: true
+
+  # Strongly recommended for your first pass.
+  # Replace these with the part numbers you actually want to identify.
+  selected_parts:
+    - "3001"
+    - "3002"
+    - "3003"
+    - "3004"
+    - "3005"
+
+model:
+  LegoPartsModelV1:
+    hidden_neurons: 32
+
+training:
+  optimizer: Adam
+  criterion: CrossEntropyLoss
+  epochs: 5
+  learning_rate: 0.001
+  batch_size: 16
+  num_workers: 0
