@@ -1,196 +1,271 @@
-from collections import defaultdict
+from __future__ import annotations
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Set
 from pathlib import Path
-import random
-
-import pandas as pd
-from PIL import Image
-from torch.utils.data import Dataset
-from torchvision import transforms
 
 
-class LegoImageDataset(Dataset):
-    def __init__(
-        self,
-        samples,
-        class_to_idx,
-        idx_to_part_num,
-        idx_to_name,
-        image_size=128,
-        grayscale=False,
-        train=False,
-    ):
-        self.samples = samples
-        self.class_to_idx = class_to_idx
-        self.idx_to_part_num = idx_to_part_num
-        self.idx_to_name = idx_to_name
-        self.image_size = image_size
-        self.grayscale = grayscale
-        self.train = train
+@dataclass
+class BoundingBox:
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
 
-        transform_steps = [transforms.Resize((image_size, image_size))]
-
-        if grayscale:
-            transform_steps.append(transforms.Grayscale(num_output_channels=1))
-
-        if train:
-            transform_steps.extend([
-                transforms.RandomRotation(15),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-            ])
-
-        transform_steps.append(transforms.ToTensor())
-        self.transform = transforms.Compose(transform_steps)
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        image_path, part_num = self.samples[idx]
-        image = Image.open(image_path).convert("RGB")
-        image = self.transform(image)
-        label = self.class_to_idx[part_num]
-        return image, label
+    def validate(self) -> None:
+        if self.xmax <= self.xmin:
+            raise ValueError(f"Invalid box: xmax ({self.xmax}) <= xmin ({self.xmin})")
+        if self.ymax <= self.ymin:
+            raise ValueError(f"Invalid box: ymax ({self.ymax}) <= ymin ({self.ymin})")
 
 
-class DataPreparation:
-    def __init__(
-        self,
-        images_root,
-        parts_csv_path,
-        image_size=128,
-        train_split=0.8,
-        random_seed=42,
-        grayscale=False,
-        selected_parts=None,
-        duplicate_singletons_for_test=True,
-    ):
-        self.images_root = Path(images_root)
-        self.parts_csv_path = Path(parts_csv_path)
-        self.image_size = image_size
-        self.train_split = train_split
-        self.random_seed = random_seed
-        self.grayscale = grayscale
-        self.selected_parts = {str(x) for x in selected_parts} if selected_parts else None
-        self.duplicate_singletons_for_test = duplicate_singletons_for_test
+@dataclass
+class VocObject:
+    class_name: str
+    bbox: BoundingBox
+    difficult: int = 0
 
-        self.width = image_size
-        self.height = image_size
-        self.image_depth = 1 if grayscale else 3
 
-        self.parts_df = pd.read_csv(self.parts_csv_path, dtype={"part_num": str})
-        required_columns = {"part_num", "name"}
-        missing = required_columns - set(self.parts_df.columns)
-        if missing:
-            raise ValueError(f"Missing required columns in parts.csv: {sorted(missing)}")
+@dataclass
+class VocAnnotation:
+    filename: str
+    width: int
+    height: int
+    objects: List[VocObject]
 
-        self.parts_df["part_num"] = self.parts_df["part_num"].astype(str).str.strip()
-        self.parts_df["name"] = self.parts_df["name"].astype(str).str.strip()
 
-        self.part_num_to_name = dict(zip(self.parts_df["part_num"], self.parts_df["name"]))
+class VocParser:
+    def parse(self, xml_path: Path) -> VocAnnotation:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
 
-        self.samples = self._collect_samples()
-        if not self.samples:
-            raise ValueError(
-                f"No images matched parts.csv under {self.images_root}. "
-                "Check your paths and extracted Kaggle dataset."
+        filename = self._get_text(root, "filename")
+        size = root.find("size")
+        if size is None:
+            raise ValueError(f"Missing <size> in {xml_path}")
+
+        width = int(self._get_text(size, "width"))
+        height = int(self._get_text(size, "height"))
+
+        if width <= 0 or height <= 0:
+            raise ValueError(f"Invalid image size in {xml_path}: {width}x{height}")
+
+        objects: List[VocObject] = []
+
+        for obj in root.findall("object"):
+            class_name = self._get_text(obj, "name")
+            difficult_text = obj.findtext("difficult", default="0").strip()
+            difficult = int(difficult_text)
+
+            bndbox = obj.find("bndbox")
+            if bndbox is None:
+                raise ValueError(f"Missing <bndbox> in {xml_path}")
+
+            bbox = BoundingBox(
+                xmin=float(self._get_text(bndbox, "xmin")),
+                ymin=float(self._get_text(bndbox, "ymin")),
+                xmax=float(self._get_text(bndbox, "xmax")),
+                ymax=float(self._get_text(bndbox, "ymax")),
             )
+            bbox.validate()
 
-        unique_part_nums = sorted({part_num for _, part_num in self.samples})
-        self.classes = unique_part_nums
-        self.class_to_idx = {part_num: idx for idx, part_num in enumerate(self.classes)}
-        self.idx_to_part_num = {idx: part_num for part_num, idx in self.class_to_idx.items()}
-        self.idx_to_name = {
-            idx: self.part_num_to_name[part_num] for idx, part_num in self.idx_to_part_num.items()
-        }
+            objects.append(VocObject(class_name=class_name, bbox=bbox, difficult=difficult))
 
-    def _infer_part_num(self, image_path: Path):
-        candidates = [
-            image_path.stem.strip(),
-            image_path.parent.name.strip(),
-            image_path.stem.split("_")[0].strip(),
-            image_path.stem.split("-")[0].strip(),
-        ]
-
-        for candidate in candidates:
-            if candidate in self.part_num_to_name:
-                return candidate
-
-        return None
-
-    def _collect_samples(self):
-        allowed_exts = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
-        samples = []
-
-        for image_path in self.images_root.rglob("*"):
-            if not image_path.is_file():
-                continue
-            if image_path.suffix.lower() not in allowed_exts:
-                continue
-
-            part_num = self._infer_part_num(image_path)
-            if part_num is None:
-                continue
-
-            if self.selected_parts and part_num not in self.selected_parts:
-                continue
-
-            samples.append((str(image_path), part_num))
-
-        return samples
-
-    def get_data(self):
-        rng = random.Random(self.random_seed)
-        grouped = defaultdict(list)
-
-        for sample in self.samples:
-            grouped[sample[1]].append(sample)
-
-        train_samples = []
-        test_samples = []
-
-        for part_num, part_samples in grouped.items():
-            local_samples = part_samples[:]
-            rng.shuffle(local_samples)
-
-            if len(local_samples) == 1:
-                # This keeps the pipeline runnable for reference-style datasets.
-                train_samples.append(local_samples[0])
-                if self.duplicate_singletons_for_test:
-                    test_samples.append(local_samples[0])
-                continue
-
-            split_idx = int(len(local_samples) * self.train_split)
-            split_idx = max(1, split_idx)
-            split_idx = min(split_idx, len(local_samples) - 1)
-
-            train_samples.extend(local_samples[:split_idx])
-            test_samples.extend(local_samples[split_idx:])
-
-        train_data = LegoImageDataset(
-            samples=train_samples,
-            class_to_idx=self.class_to_idx,
-            idx_to_part_num=self.idx_to_part_num,
-            idx_to_name=self.idx_to_name,
-            image_size=self.image_size,
-            grayscale=self.grayscale,
-            train=True,
+        return VocAnnotation(
+            filename=filename,
+            width=width,
+            height=height,
+            objects=objects,
         )
 
-        test_data = LegoImageDataset(
-            samples=test_samples,
-            class_to_idx=self.class_to_idx,
-            idx_to_part_num=self.idx_to_part_num,
-            idx_to_name=self.idx_to_name,
-            image_size=self.image_size,
-            grayscale=self.grayscale,
-            train=False,
+    @staticmethod
+    def _get_text(parent: ET.Element, tag: str) -> str:
+        node = parent.find(tag)
+        if node is None or node.text is None:
+            raise ValueError(f"Missing <{tag}>")
+        return node.text.strip()
+
+
+class ClassMapBuilder:
+    def __init__(self, parser: VocParser) -> None:
+        self.parser = parser
+
+    def build_from_directory(self, annotation_dir: Path) -> Dict[str, int]:
+        class_names: Set[str] = set()
+
+        # Added filtering to ignore hidden files like .DS_Store or ._metadata
+        xml_files = [f for f in annotation_dir.glob("*.xml") if not f.name.startswith('.')]
+
+        for xml_file in sorted(xml_files):
+            try:
+                annotation = self.parser.parse(xml_file)
+                for obj in annotation.objects:
+                    class_names.add(obj.class_name)
+            except ET.ParseError as e:
+                print(f"Skipping {xml_file}: XML is not well-formed. Error: {e}")
+                continue
+            except Exception as e:
+                print(f"Skipping {xml_file} due to unexpected error: {e}")
+                continue
+
+        sorted_names = sorted(
+            class_names, 
+            key=lambda x: (0, int(x)) if x.isdigit() else (1, x)
+        )
+        return {name: idx for idx, name in enumerate(sorted_names)}
+
+
+class YoloConverter:
+    def __init__(self, class_to_id: Dict[str, int]) -> None:
+        self.class_to_id = class_to_id
+
+    def convert_object(self, obj: VocObject, img_width: int, img_height: int) -> str:
+        if obj.class_name not in self.class_to_id:
+            raise KeyError(f"Unknown class '{obj.class_name}'")
+
+        x_center, y_center, width, height = self._voc_to_yolo(
+            obj.bbox,
+            img_width,
+            img_height,
         )
 
-        return train_data, test_data
+        class_id = self.class_to_id[obj.class_name]
+        return f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}"
 
-    def get_part_num_from_index(self, idx):
-        return self.idx_to_part_num[idx]
+    @staticmethod
+    def _voc_to_yolo(
+        bbox: BoundingBox,
+        img_width: int,
+        img_height: int,
+    ) -> Tuple[float, float, float, float]:
+        # Clamp to valid image bounds
+        xmin = max(0.0, min(bbox.xmin, img_width))
+        xmax = max(0.0, min(bbox.xmax, img_width))
+        ymin = max(0.0, min(bbox.ymin, img_height))
+        ymax = max(0.0, min(bbox.ymax, img_height))
 
-    def get_part_name_from_index(self, idx):
-        return self.idx_to_name[idx]
+        if xmax <= xmin or ymax <= ymin:
+            raise ValueError("Box became invalid after clamping")
+
+        x_center = ((xmin + xmax) / 2.0) / img_width
+        y_center = ((ymin + ymax) / 2.0) / img_height
+        width = (xmax - xmin) / img_width
+        height = (ymax - ymin) / img_height
+
+        return x_center, y_center, width, height
+
+
+class YoloWriter:
+    def write(self, output_path: Path, lines: List[str]) -> None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+class DatasetConverter:
+    def __init__(
+        self,
+        parser: VocParser,
+        converter: YoloConverter,
+        writer: YoloWriter,
+        skip_unknown: bool = False,
+        skip_difficult: bool = False,
+    ) -> None:
+        self.parser = parser
+        self.converter = converter
+        self.writer = writer
+        self.skip_unknown = skip_unknown
+        self.skip_difficult = skip_difficult
+
+    def convert_file(self, xml_path: Path, output_dir: Path) -> Tuple[int, int]:
+        annotation = self.parser.parse(xml_path)
+
+        yolo_lines: List[str] = []
+        skipped = 0
+
+        for obj in annotation.objects:
+            if self.skip_difficult and obj.difficult == 1:
+                skipped += 1
+                continue
+
+            try:
+                line = self.converter.convert_object(
+                    obj=obj,
+                    img_width=annotation.width,
+                    img_height=annotation.height,
+                )
+                yolo_lines.append(line)
+            except KeyError as e:
+                skipped += 1
+                if not self.skip_unknown:
+                    raise e
+
+        output_file = output_dir / f"{xml_path.stem}.txt"
+        self.writer.write(output_file, yolo_lines)
+        return len(yolo_lines), skipped
+
+    def convert_directory(self, annotation_dir: Path, output_dir: Path) -> None:
+        # Assuming images are in a sibling folder to 'annotations'
+        image_dir = annotation_dir.parent / "images" 
+        
+        xml_files = [f for f in annotation_dir.glob("*.xml") if not f.name.startswith('.')]
+        
+        if not xml_files:
+            raise FileNotFoundError(f"No XML files found in {annotation_dir}")
+
+        total_written = 0
+        total_skipped = 0
+
+        for xml_file in sorted(xml_files):
+            try:
+                written, skipped = self.convert_file(xml_file, output_dir)
+                total_written += written
+                total_skipped += skipped
+            except (ET.ParseError, ValueError) as e:
+                print(f"!!! Found Corrupt File: {xml_file.name}")
+                total_skipped += 1
+                
+                # Logic to find and delete the orphaned image
+                # Checks for common extensions like .jpg, .jpeg, .png
+                for ext in ['.jpg', '.jpeg', '.png']:
+                    img_path = image_dir / f"{xml_file.stem}{ext}"
+                    if img_path.exists():
+                        print(f"--- Deleting orphaned image: {img_path.name}")
+                        img_path.unlink() # This deletes the file
+                
+                # Optional: Delete the bad XML itself so it doesn't bother you again
+                # xml_file.unlink() 
+                continue
+
+        print(f"\n--- Process Complete ---")
+        print(f"Labels Created: {total_written}")
+        print(f"Files Skipped/Cleaned: {total_skipped}")
+
+
+def main() -> None:
+    annotation_dir = Path("./Lego_Project_Object_Detection/Dataset/annotations")
+    output_dir = Path("./Dataset/labels")
+
+    parser = VocParser()
+    class_map_builder = ClassMapBuilder(parser)
+    class_to_id = class_map_builder.build_from_directory(annotation_dir)
+
+    print(f"Found {len(class_to_id)} classes")
+    print(class_to_id)
+
+    converter = YoloConverter(class_to_id=class_to_id)
+    writer = YoloWriter()
+
+    dataset_converter = DatasetConverter(
+        parser=parser,
+        converter=converter,
+        writer=writer,
+        skip_unknown=False,
+        skip_difficult=False,
+    )
+
+    dataset_converter.convert_directory(annotation_dir, output_dir)
+    print("Conversion complete")
+
+
+if __name__ == "__main__":
+    main()
